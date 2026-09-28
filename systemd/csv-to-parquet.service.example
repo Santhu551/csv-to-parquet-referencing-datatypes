@@ -1,0 +1,15 @@
+# Copy to /etc/systemd/system/csv-to-parquet.service after changing User/WorkingDirectory.
+[Unit]
+Description=Archive Viewer compatible CSV to Parquet converter
+After=network.target
+
+[Service]
+Type=simple
+User=postgres
+WorkingDirectory=/opt/csv_to_parquet_archiveviewer_standalone
+ExecStart=/usr/bin/python3 /opt/csv_to_parquet_archiveviewer_standalone/main.py --config /opt/csv_to_parquet_archiveviewer_standalone/config/settings.txt
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
