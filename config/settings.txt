@@ -1,8 +1,8 @@
 # Standalone CSV -> Parquet converter settings
 # Linux only. Values on the right of = are used; comments begin with #.
-INPUT_PATH=/home/postgres/santhosh_bsc/csv_location/new_4_test/ecm_output/48
-OUTPUT_PATH=/home/postgres/santhosh_bsc/script_par_loc/new4latest/parquet
-DATATYPE_JSON=/home/postgres/santhosh_bsc/csv_location/new_4_test/datatypes_48.json
+INPUT_PATH=/path/to/csv/input/ecm_output/<folder>
+OUTPUT_PATH=/path/to/parquet/output
+DATATYPE_JSON=/path/to/datatypes.json
 
 # Original conversion switches
 WITH_CLOB=true
