@@ -4,3 +4,13 @@ logs/
 
 # Generated conversion status
 status/conversion_status.csv
+
+# Python
+__pycache__/
+*.py[cod]
+
+src/__pycache__/
+*.pyc
+
+status/
+

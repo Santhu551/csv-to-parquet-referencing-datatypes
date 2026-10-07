@@ -1,7 +1,10 @@
 import json
 import logging
+import os
 import re
 import shutil
+import traceback
+from datetime import datetime
 from pathlib import Path
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.functions import rtrim, udf
@@ -26,15 +29,22 @@ def logger(log_dir, output_path=None):
     return l
 
 
-def spark_session(settings):
-    b=SparkSession.builder.appName("ArchiveViewer-CSV-to-Parquet-Standalone")
-    for k,v in {
-      "spark.driver.memory":settings.get("SPARK_DRIVER_MEMORY","4g"),
-      "spark.executor.memory":settings.get("SPARK_EXECUTOR_MEMORY","4g"),
-      "spark.sql.shuffle.partitions":settings.get("SPARK_SQL_SHUFFLE_PARTITIONS","200"),
-      "spark.network.timeout":settings.get("SPARK_NETWORK_TIMEOUT","800s"),
-      "spark.executor.heartbeatInterval":settings.get("SPARK_EXECUTOR_HEARTBEAT_INTERVAL","60s"),
-    }.items(): b=b.config(k,v)
+def spark_session(settings, base_dir):
+    project_dir = str(Path(base_dir).resolve())
+
+    b = SparkSession.builder.appName("ArchiveViewer-CSV-to-Parquet-Standalone")
+
+    for k, v in {
+        "spark.driver.memory": settings.get("SPARK_DRIVER_MEMORY", "4g"),
+        "spark.executor.memory": settings.get("SPARK_EXECUTOR_MEMORY", "4g"),
+        "spark.sql.shuffle.partitions": settings.get("SPARK_SQL_SHUFFLE_PARTITIONS", "200"),
+        "spark.network.timeout": settings.get("SPARK_NETWORK_TIMEOUT", "800s"),
+        "spark.executor.heartbeatInterval": settings.get("SPARK_EXECUTOR_HEARTBEAT_INTERVAL", "60s"),
+        "spark.driver.extraPythonPath": project_dir,
+        "spark.executorEnv.PYTHONPATH": project_dir,
+    }.items():
+        b = b.config(k, v)
+
     return b.getOrCreate()
 
 
@@ -181,71 +191,355 @@ def _report_failed(report):
         pass
     return False
 
+def write_current_run(path, data):
+    """
+    Persist the current conversion run state.
+
+    This file is intentionally small and contains only summary
+    information. Detailed per-file results remain in the run report.
+    """
+
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    path.write_text(
+        json.dumps(
+            data,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+
+# def run(settings, base_dir):
+#     log_dir=Path(settings.get("LOG_DIR",str(base_dir/"logs")))
+#     status_dir=Path(settings.get("STATUS_DIR",str(base_dir/"status")))
+#     manifest=status_dir/"conversion_status.csv"
+#     # Resolve output before creating the application/date-specific logger.
+#     # The previous build called logger(..., out) before assigning out, which
+#     # caused UnboundLocalError when main.py was run directly.
+#     inp=Path(settings["INPUT_PATH"]); out=Path(settings["OUTPUT_PATH"]); dtype=Path(settings["DATATYPE_JSON"])
+#     log=logger(log_dir, out)
+#     spark_types=json.loads((base_dir/"config"/"spark_datatypes.json").read_text(encoding="utf-8"))
+#     out.mkdir(parents=True,exist_ok=True); status_dir.mkdir(parents=True,exist_ok=True)
+#     if inp.is_file(): files=[inp]
+#     else: files=sorted([p for p in inp.rglob("*.CSV")]+[p for p in inp.rglob("*.csv")])
+#     log.info("Found %d CSV file(s)",len(files))
+#     previous=latest_by_input(manifest)
+#     report = start_report(out, inp, len(files))
+#     log.info("APPLICATION: %s", report["app"])
+#     log.info("RUN REPORT : %s", report["path"])
+#     log.info("ERROR LOG  : %s", report["error_path"])
+#     spark=spark_session(settings)
+#     try:
+#         for csv in files:
+#             if previous.get(str(csv),{}).get("status")=="SUCCESS" and Path(previous[str(csv)].get("output","")).exists():
+#                 log.info("SKIP already successful: %s",csv); continue
+#             schema, table = fetch_schema_and_table(csv)
+#             # Archive Viewer keeps the normal parquet directory for unqualified
+#             # CSVs. When a CSV filename is schema-qualified (for example
+#             # OPTIMSRC130.OPTIM_ORDERS2-...), it creates a sibling schema-specific
+#             # root: <base>_<schema>/parquet/. This prevents different schemas from
+#             # mixing tables while preserving the normal path for unqualified files.
+#             csv_output = out
+#             if schema:
+#                 parent = out.parent
+#                 csv_output = parent / f"{parent.name}_{schema}" / out.name
+#             csv_output.mkdir(parents=True, exist_ok=True)
+#             log.info("SCHEMA OUTPUT: %s", csv_output)
+#             append_record(manifest,{"timestamp":now(),"status":"RUNNING","input":str(csv),"table":table,"guid":"","output":str(csv_output),"rows":"","parquet_file":"","error":""})
+#             try:
+#                 final = process_csv(spark,csv,csv_output,dtype,settings,spark_types,log,manifest)
+#                 parquet_files = list(final.glob("*.parquet"))
+#                 rows = 0
+#                 latest = latest_by_input(manifest).get(str(csv), {})
+#                 try:
+#                     rows = int(latest.get("rows") or 0)
+#                 except (TypeError, ValueError):
+#                     rows = 0
+#                 add_file_result(report, {
+#                     "status":"SUCCESS", "csv":str(csv), "schema":schema or "",
+#                     "table":table, "output":str(final), "rows":rows,
+#                     "parquet_file":str(parquet_files[0]) if parquet_files else ""
+#                 })
+#                 log.info("FILE SUCCESS: %s | rows=%s | output=%s", table, rows, final)
+#             except Exception as e:
+#                 log.exception("FAILED: %s",csv)
+#                 error_text = __import__("traceback").format_exc()
+#                 append_record(manifest,{"timestamp":now(),"status":"FAILED","input":str(csv),"table":table,"guid":"","output":"","rows":"","parquet_file":"","error":repr(e)})
+#                 append_error(report, csv, error_text)
+#                 add_file_result(report, {
+#                     "status":"FAILED", "csv":str(csv), "schema":schema or "",
+#                     "table":table, "output":"", "rows":0, "error":repr(e)
+#                 })
+#                 log.error("FILE FAILED: %s | error log=%s", table, report["error_path"])
+#         final_status = "FAILED" if _report_failed(report) else "SUCCESS"
+#         finish_report(report, final_status)
+#         log.info("Conversion run finished. Application=%s Status=%s Report=%s", report["app"], final_status, report["path"])
+#     finally:
+#         spark.stop()
 
 def run(settings, base_dir):
-    log_dir=Path(settings.get("LOG_DIR",str(base_dir/"logs")))
-    status_dir=Path(settings.get("STATUS_DIR",str(base_dir/"status")))
-    manifest=status_dir/"conversion_status.csv"
-    # Resolve output before creating the application/date-specific logger.
-    # The previous build called logger(..., out) before assigning out, which
-    # caused UnboundLocalError when main.py was run directly.
-    inp=Path(settings["INPUT_PATH"]); out=Path(settings["OUTPUT_PATH"]); dtype=Path(settings["DATATYPE_JSON"])
-    log=logger(log_dir, out)
-    spark_types=json.loads((base_dir/"config"/"spark_datatypes.json").read_text(encoding="utf-8"))
-    out.mkdir(parents=True,exist_ok=True); status_dir.mkdir(parents=True,exist_ok=True)
-    if inp.is_file(): files=[inp]
-    else: files=sorted([p for p in inp.rglob("*.CSV")]+[p for p in inp.rglob("*.csv")])
-    log.info("Found %d CSV file(s)",len(files))
-    previous=latest_by_input(manifest)
+    log_dir = Path(settings.get("LOG_DIR", str(base_dir / "logs")))
+    status_dir = Path(settings.get("STATUS_DIR", str(base_dir / "status")))
+    manifest = status_dir / "conversion_status.csv"
+    current_run_path = status_dir / "current_run.json"
+
+    inp = Path(settings["INPUT_PATH"]).expanduser().resolve()
+    out = Path(settings["OUTPUT_PATH"]).expanduser().resolve()
+    dtype = Path(settings["DATATYPE_JSON"]).expanduser().resolve()
+
+    out.mkdir(parents=True, exist_ok=True)
+    status_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log = logger(log_dir, out)
+
+    spark_types = json.loads(
+        (base_dir / "config" / "spark_datatypes.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    files = (
+        [inp]
+        if inp.is_file()
+        else sorted(list(inp.rglob("*.CSV")) + list(inp.rglob("*.csv")))
+    )
+
+    log.info("Found %d CSV file(s)", len(files))
+
+    previous = latest_by_input(manifest)
     report = start_report(out, inp, len(files))
+
     log.info("APPLICATION: %s", report["app"])
     log.info("RUN REPORT : %s", report["path"])
     log.info("ERROR LOG  : %s", report["error_path"])
-    spark=spark_session(settings)
+
+    current_run = {
+        "status": "RUNNING",
+        "pid": os.getpid(),
+        "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": "",
+        "input_path": str(inp),
+        "output_path": str(out),
+        "datatype_json": str(dtype),
+        "log_path": "",
+        "report_path": str(report["path"]),
+        "error_log_path": str(report["error_path"]),
+        "csv_files": len(files),
+        "processed": 0,
+        "success": 0,
+        "failed": 0,
+        "rows": 0
+    }
+
+    for handler in log.handlers:
+        if isinstance(handler, logging.FileHandler):
+            current_run["log_path"] = str(Path(handler.baseFilename).resolve())
+            break
+
+    write_current_run(current_run_path, current_run)
+
+    # spark = spark_session(settings)
+    spark = spark_session(settings, base_dir)
+
     try:
         for csv in files:
-            if previous.get(str(csv),{}).get("status")=="SUCCESS" and Path(previous[str(csv)].get("output","")).exists():
-                log.info("SKIP already successful: %s",csv); continue
+            previous_file = previous.get(str(csv), {})
+
+            if (
+                previous_file.get("status") == "SUCCESS"
+                and Path(previous_file.get("output", "")).exists()
+            ):
+                log.info("SKIP already successful: %s", csv)
+                continue
+
             schema, table = fetch_schema_and_table(csv)
-            # Archive Viewer keeps the normal parquet directory for unqualified
-            # CSVs. When a CSV filename is schema-qualified (for example
-            # OPTIMSRC130.OPTIM_ORDERS2-...), it creates a sibling schema-specific
-            # root: <base>_<schema>/parquet/. This prevents different schemas from
-            # mixing tables while preserving the normal path for unqualified files.
             csv_output = out
+
             if schema:
                 parent = out.parent
                 csv_output = parent / f"{parent.name}_{schema}" / out.name
+
             csv_output.mkdir(parents=True, exist_ok=True)
-            log.info("SCHEMA OUTPUT: %s", csv_output)
-            append_record(manifest,{"timestamp":now(),"status":"RUNNING","input":str(csv),"table":table,"guid":"","output":str(csv_output),"rows":"","parquet_file":"","error":""})
+
+            append_record(
+                manifest,
+                {
+                    "timestamp": now(),
+                    "status": "RUNNING",
+                    "input": str(csv),
+                    "table": table,
+                    "guid": "",
+                    "output": str(csv_output),
+                    "rows": "",
+                    "parquet_file": "",
+                    "error": ""
+                }
+            )
+
             try:
-                final = process_csv(spark,csv,csv_output,dtype,settings,spark_types,log,manifest)
+                final = process_csv(
+                    spark,
+                    csv,
+                    csv_output,
+                    dtype,
+                    settings,
+                    spark_types,
+                    log,
+                    manifest
+                )
+
                 parquet_files = list(final.glob("*.parquet"))
-                rows = 0
                 latest = latest_by_input(manifest).get(str(csv), {})
+
                 try:
                     rows = int(latest.get("rows") or 0)
                 except (TypeError, ValueError):
                     rows = 0
-                add_file_result(report, {
-                    "status":"SUCCESS", "csv":str(csv), "schema":schema or "",
-                    "table":table, "output":str(final), "rows":rows,
-                    "parquet_file":str(parquet_files[0]) if parquet_files else ""
-                })
-                log.info("FILE SUCCESS: %s | rows=%s | output=%s", table, rows, final)
+
+                add_file_result(
+                    report,
+                    {
+                        "status": "SUCCESS",
+                        "csv": str(csv),
+                        "schema": schema or "",
+                        "table": table,
+                        "output": str(final),
+                        "rows": rows,
+                        "parquet_file": (
+                            str(parquet_files[0])
+                            if parquet_files else ""
+                        )
+                    }
+                )
+
+                log.info(
+                    "FILE SUCCESS: %s | rows=%s | output=%s",
+                    table,
+                    rows,
+                    final
+                )
+
             except Exception as e:
-                log.exception("FAILED: %s",csv)
-                error_text = __import__("traceback").format_exc()
-                append_record(manifest,{"timestamp":now(),"status":"FAILED","input":str(csv),"table":table,"guid":"","output":"","rows":"","parquet_file":"","error":repr(e)})
+                error_text = traceback.format_exc()
+                log.exception("FAILED: %s", csv)
+
+                append_record(
+                    manifest,
+                    {
+                        "timestamp": now(),
+                        "status": "FAILED",
+                        "input": str(csv),
+                        "table": table,
+                        "guid": "",
+                        "output": "",
+                        "rows": "",
+                        "parquet_file": "",
+                        "error": repr(e)
+                    }
+                )
+
                 append_error(report, csv, error_text)
-                add_file_result(report, {
-                    "status":"FAILED", "csv":str(csv), "schema":schema or "",
-                    "table":table, "output":"", "rows":0, "error":repr(e)
-                })
-                log.error("FILE FAILED: %s | error log=%s", table, report["error_path"])
-        final_status = "FAILED" if _report_failed(report) else "SUCCESS"
+
+                add_file_result(
+                    report,
+                    {
+                        "status": "FAILED",
+                        "csv": str(csv),
+                        "schema": schema or "",
+                        "table": table,
+                        "output": "",
+                        "rows": 0,
+                        "error": repr(e)
+                    }
+                )
+
+            try:
+                report_data = json.loads(
+                    Path(report["path"]).read_text(encoding="utf-8")
+                )
+                runs = report_data.get("runs", [])
+                latest_run = runs[-1] if runs else {}
+
+                current_run["processed"] = latest_run.get(
+                    "processed", current_run["processed"] + 1
+                )
+                current_run["success"] = latest_run.get(
+                    "success", current_run["success"]
+                )
+                current_run["skipped"] = latest_run.get(
+                    "skipped", current_run["skipped"]
+)
+                current_run["failed"] = latest_run.get(
+                    "failed", current_run["failed"]
+                )
+                current_run["rows"] = latest_run.get(
+                    "rows", current_run["rows"]
+                )
+            except Exception:
+                current_run["processed"] += 1
+
+            write_current_run(current_run_path, current_run)
+
+        failed = _report_failed(report)
+        final_status = "FAILED" if failed else "SUCCESS"
         finish_report(report, final_status)
-        log.info("Conversion run finished. Application=%s Status=%s Report=%s", report["app"], final_status, report["path"])
+
+        try:
+            report_data = json.loads(
+                Path(report["path"]).read_text(encoding="utf-8")
+            )
+            runs = report_data.get("runs", [])
+            latest_run = runs[-1] if runs else {}
+
+            current_run["processed"] = latest_run.get(
+                "processed", current_run["processed"]
+            )
+            current_run["success"] = latest_run.get(
+                "success", current_run["success"]
+            )
+            current_run["failed"] = latest_run.get(
+                "failed", current_run["failed"]
+            )
+            current_run["skipped"] = latest_run.get(
+                "skipped", current_run["skipped"]
+            )
+            current_run["rows"] = latest_run.get(
+                "rows", current_run["rows"]
+            )
+            current_run["end_time"] = latest_run.get(
+                "end_time",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        except Exception as exc:
+            log.warning("Could not read final report statistics: %s", exc)
+            current_run["end_time"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        current_run["status"] = final_status
+        write_current_run(current_run_path, current_run)
+
+        log.info(
+            "Conversion run finished. Application=%s Status=%s Report=%s",
+            report["app"],
+            final_status,
+            report["path"]
+        )
+
     finally:
         spark.stop()
+        pid_file = status_dir / "converter.pid"
+
+        if pid_file.exists():
+            try:
+                if pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pid_file.unlink()
+            except OSError:
+                pass

@@ -1,130 +1,207 @@
 # Standalone Archive Viewer CSV -> Parquet Converter
 
-This project is a standalone extraction of the CSV -> Parquet conversion path from the supplied Archive Viewer source. It intentionally retains the original datatype/message-code concepts and the original Linux CLOB/BLOB behavior, while removing MetaDB, external-table creation, UI, user management, and unrelated Archive Viewer workflows.
+1. Customer Execution Guide
+1.1 Prerequisites
+Before starting the conversion, ensure the Linux server has:
+- Python 3.12
+- Java
+- Required Python packages
+- CSV files generated from Archive Viewer
+- Required datatypes.json
+Install the Python dependencies:
+python3.12 -m pip install -r requirements.txt
 
-## Main entry point
+2. Input Files
+The customer should have the CSV files and corresponding datatype JSON available on the server.
+Example:
+/home/postgres/input/
+├── ecm_output/
+│   └── 36/
+│       ├── invoices-F54FD320-AD46-11EF-AEE6-005056A9AB1E-220926024328.CSV
+│       └── invoice_archivefile_linux_mssqlserver_15_36/
+│           └── invoices_COMMENTS_0.LOB
+│
+└── datatypes_36.json
 
-```bash
-python3 main.py --config config/settings.txt
-```
+The CSV can be a single file or the input can contain multiple CSV files.
 
-Edit **only** `config/settings.txt` for normal operation:
-- INPUT_PATH: a CSV file or a directory containing CSVs
-- OUTPUT_PATH: destination directory
-- DATATYPE_JSON: `datatypes_<id>.json`
-- WITH_CLOB / WITH_BLOB
-- DELETE_LOB_FILES / DELETE_CSV
-- Spark memory/timeout settings
-- Tika settings
+3. Run the Conversion
+Recommended method
+Run:
+python3.12 main.py <INPUT_PATH> <OUTPUT_PATH> <DATATYPE_JSON>
 
-## Background execution
+Example:
+python3.12 main.py \
+/home/postgres/input/ecm_output/36 \
+/home/postgres/output/parquet \
+/home/postgres/input/datatypes_36.json
 
-For a terminal-independent run:
+Parameters
+Parameter	Description
+INPUT_PATH	CSV file or directory containing CSV files
+OUTPUT_PATH	Location where Parquet output will be created
+DATATYPE_JSON	Path to the corresponding datatype JSON
 
-```bash
+
+Note: The output directory does not need to be created manually. The converter creates it automatically if it does not exist.
+
+4. Run in Background
+For large conversions, use the background execution script so that the conversion continues even after the terminal session is disconnected.
 ./scripts/run_background.sh
+
+Check the conversion status:
 ./scripts/status.sh
+
+Stop a running conversion:
 ./scripts/stop.sh
-```
 
-For server/reboot resilience, use the included systemd example. `nohup` survives terminal disconnects; systemd is the appropriate option if the process must be restarted after a machine reboot or unexpected service failure.
+5. Check Conversion Status
+Run:
+./scripts/status.sh
 
-## Tracking
+The status displays the overall conversion information, for example:
+============================================================
+             CSV -> PARQUET STATUS
+============================================================
 
-`status/conversion_status.csv` records RUNNING/SUCCESS/FAILED for every CSV, including table, GUID, output path, row count and error. A successful input/output is skipped on a later run.
+STATUS       : PARTIAL SUCCESS
+STARTED      : 2026-10-07 08:20:10
+COMPLETED    : 2026-10-07 08:42:35
 
-The converter writes each table to:
+INPUT        : /home/postgres/input
+OUTPUT       : /home/postgres/output
 
-```text
-OUTPUT_PATH/<table>.parquet/
-```
+TOTAL FILES  : 5000
+PROCESSED    : 4980
+SUCCESS      : 4970
+SKIPPED      : 20
+FAILED       : 10
+TOTAL ROWS   : 45231000
 
-It writes to `<table>.parquet.__inprogress__` first and renames it only after Spark has produced Parquet data. This prevents an interrupted job from being mistaken for a completed conversion.
+------------------------------------------------------------
+REPORTS
+------------------------------------------------------------
 
-## Large files / memory
+APPLICATION REPORT :
+/home/postgres/output/application_2026-10-07.json
 
-The original conversion used `toLocalIterator()` to copy every LOB path into a Python list. That is a driver-memory growth point. This standalone version does **not** collect the complete CSV or all LOB paths on the driver. Spark performs the CSV transformation and Parquet write; LOB bytes are read per executor row as required by the original BLOB/CLOB behavior. Cleanup, when enabled, streams paths with `toLocalIterator()` instead of accumulating them.
+ERROR LOG :
+/home/postgres/output/application_2026-10-07_error.log
 
-No Base64/hex conversion is used for BLOBs: BLOB data is returned as raw bytes through Spark `BinaryType`.
+DETAILED LOG :
+/home/postgres/output/logs/application-2026-10-07.log
 
-## Important original mappings
+The customer does not need to inspect thousands of individual entries from the terminal.
+Detailed file-level information is stored in:
+status/conversion_status.csv
 
-`221 -> TABLE_INFO`, `130 -> CHAR`, `131 -> timestamp`, `132 -> date`, `164 -> NUMBER`, `166 -> DECIMAL`, `249 -> linux`, `250 -> windows`, `265 -> CLOB`, `266 -> BLOB`, `353 -> LOB_COLUMNS`, `356 -> TIMESTAMP WITH LOCAL TIME ZONE`, `359 -> Enterprise Content Management(CSV)`, `360 -> NATIVE_LOB_PRESENT`, `361 -> SQL_SERVER_DATABASE`.
+6. Check the Output
+For each successfully converted CSV, a corresponding Parquet directory is created.
+Example:
+/home/postgres/output/parquet/
+└── invoices.parquet/
 
-The actual datatype lookup is therefore:
+For schema-qualified tables, the converter follows the schema-specific output structure.
+Example:
+/home/postgres/output_OPTIMSRC144/parquet/
+└── OPTIM_ORDERS.parquet/
 
-```python
-data[GUID][messages["messagecode"]["221"]][table][column]
-#                         -> "TABLE_INFO"
-```
+7. If Some Files Fail
+If the status shows:
+FAILED : 10
 
-For the supplied `datatypes_36.json`, this is:
+check the generated error log:
+<application>_YYYY-MM-DD_error.log
 
-```python
-data[GUID]["TABLE_INFO"]["invoices"]["COMMENTS"]
-# -> "NVARCHAR"
-```
+The source CSV is retained when conversion fails, so the failed file can be investigated and processed again.
+The detailed file-level status is available in:
+status/conversion_status.csv
 
-## Dependencies
+8. Running the Same Input Again
+The converter keeps track of successfully converted files.
+If a CSV was already successfully converted and its Parquet output still exists, it is skipped on the next run.
+Therefore, the customer does not need to manually remove successful entries before running the conversion again.
+OVERWRITE=true is used when a file actually reaches the conversion stage and an existing Parquet output needs to be replaced. It does not by itself force previously successful files to be reconverted.
 
-The supplied environment information identifies PySpark 3.5.1, chardet 5.2.0 and tika 2.6.0 for the relevant conversion path. Install with:
+9. Important Output Locations
+After a conversion, the customer mainly needs to check these locations:
+Parquet output
+    ↓
+<OUTPUT_PATH>/
 
-```bash
-python3 -m pip install -r requirements.txt
-```
+Application report
+    ↓
+<application>_YYYY-MM-DD.json
 
-Java is required by Spark and by an Apache Tika server when Tika is configured for auto-start.
+Error report
+    ↓
+<application>_YYYY-MM-DD_error.log
 
-## Scope intentionally excluded
+Detailed conversion status
+    ↓
+status/conversion_status.csv
 
-No MetaDB writes, external-table creation, PostgreSQL FDW creation, query-server operations, UI, user management, AF conversion, ECM conversion, or unrelated process tracking are performed by this standalone converter.
+Detailed application log
+    ↓
+logs/<application>-YYYY-MM-DD.log
 
+10. Configuration File
+For advanced configuration, the customer can use:
+config/settings.txt
 
-### Native VARCHAR/NVARCHAR handling
-For SQL Server native LOB exports, not every VARCHAR/NVARCHAR column is a CLOB sidecar. The converter now preserves ordinary text values and dereferences a value only when it points to an existing LOB file. Explicit CLOB/NCLOB/etc. datatypes continue to use the CLOB reader. This prevents ordinary string columns from becoming NULL.
+This contains options such as:
+INPUT_PATH
+OUTPUT_PATH
+DATATYPE_JSON
+WITH_CLOB
+WITH_BLOB
+DELETE_LOB_FILES
+DELETE_CSV
+COMPRESSION
+Spark settings
+Tika settings
 
+For normal execution, the recommended method is the direct:
+python3.12 main.py <INPUT_PATH> <OUTPUT_PATH> <DATATYPE_JSON>
 
-### v12 LOB path resolution
-LOB values are resolved from absolute paths, CSV-relative paths, paths containing the `ecm_output` prefix, and bare filenames in immediate sibling sidecar directories. Ordinary native VARCHAR/NVARCHAR values are preserved as text when they do not resolve to a real file. BLOB remains raw bytes (`BinaryType`); CLOB remains decoded text using chardet. The converter does not recursively index all LOB files or collect all CSV LOB paths on the driver.
+11. Conversion Options
+CLOB/BLOB
+The customer can control whether CLOB/BLOB processing is enabled through the configuration.
+Delete LOB files
+DELETE_LOB_FILES=true
 
-### Schema-qualified CSV output layout
+removes successfully processed LOB files.
+Delete source CSV
+DELETE_CSV=true
 
-The converter preserves the normal configured `OUTPUT_PATH` for CSVs whose table filename has no schema prefix. If the table token is schema-qualified, for example `OPTIMSRC130.OPTIM_ORDERS2-...CSV`, the converter creates a schema-specific sibling directory using the same layout used by Archive Viewer:
+removes the source CSV only after successful Parquet generation.
+By default, source files should be retained unless cleanup is explicitly enabled.
 
-```text
-<base>/parquet/                              # unqualified CSVs
-<base>_OPTIMSRC130/parquet/                  # OPTIMSRC130 CSVs
-<base>_OPTIMSRC144/parquet/                  # OPTIMSRC144 CSVs
-```
+12. Troubleshooting
+Check whether the process is running
+./scripts/status.sh
 
-For example, with `OUTPUT_PATH=/home/postgres/yashwanth/mem_err_yash_created_af/parquet`:
+Stop the process
+./scripts/stop.sh
 
-```text
-/home/postgres/yashwanth/mem_err_yash_created_af/parquet/OPTIM_PST_ACTIONS.parquet/
-/home/postgres/yashwanth/mem_err_yash_created_af_OPTIMSRC130/parquet/TBLEST_OPTIMDETAILS.parquet/
-/home/postgres/yashwanth/mem_err_yash_created_af_OPTIMSRC144/parquet/<table>.parquet/
-```
+Check failed files
+status/conversion_status.csv
 
-The schema prefix is taken from the CSV table token before the first `.`; the table name used for `TABLE_INFO` lookup is the portion after the `.`. Unqualified filenames continue to use the original table-name extraction behavior.
+Check detailed error
+<application>_YYYY-MM-DD_error.log
 
+Check detailed execution log
+logs/
 
-## Customer-friendly run reports
+13. Technical Details
+This section should come after all customer execution steps, not before them.
+Then we can keep the existing sections you already have, but make them much shorter:
+- Datatype handling
+- BLOB/CLOB handling
+- Memory handling
+- Schema-qualified tables
+- Parquet/ZSTD
+- Archive Viewer mappings
+- Scope intentionally excluded
+- Dependencies
 
-Each run also creates a date-based application report next to the configured `parquet` directory. If `OUTPUT_PATH` is:
-
-```text
-/home/postgres/santhosh_bsc/script_par_loc/new5test/parquet
-```
-
-the report files are:
-
-```text
-/home/postgres/santhosh_bsc/script_par_loc/new5test/new5test_2026-09-25.json
-/home/postgres/santhosh_bsc/script_par_loc/new5test/new5test_2026-09-25_error.log   # created only when a file fails
-```
-
-The JSON contains the run start/end time, overall status, input/output paths, total CSV count, processed/success/failed counts, total rows, and a per-CSV result. The error log contains the complete traceback for failed CSVs.
-
-`./scripts/status.sh` is intentionally customer-friendly. It shows RUNNING or the last completed result, application name, run time, file counts, rows, and each CSV's SUCCESS/FAILED status instead of dumping the full CSV manifest. The detailed `status/conversion_status.csv` remains available for technical troubleshooting.
-
-The background launcher removes its PID file when the run completes or is terminated, so a completed run is no longer reported as a stale running process.

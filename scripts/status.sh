@@ -1,70 +1,138 @@
 #!/bin/bash
+
 set -euo pipefail
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PIDFILE="$ROOT/status/converter.pid"
+RUNINFO="$ROOT/status/current_run.json"
 
-if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-  echo "============================================================"
-  echo "CSV -> PARQUET STATUS"
-  echo "============================================================"
-  echo "STATUS    : RUNNING"
-  echo "PID       : $(cat "$PIDFILE")"
-else
-  rm -f "$PIDFILE"
-  echo "============================================================"
-  echo "CSV -> PARQUET STATUS"
-  echo "============================================================"
-  echo "STATUS    : NOT RUNNING"
+echo
+echo "============================================================"
+echo "             CSV -> PARQUET STATUS"
+echo "============================================================"
+echo
+
+# ------------------------------------------------------------
+# Process status
+# ------------------------------------------------------------
+
+PROCESS_STATUS="NOT RUNNING"
+PID=""
+
+if [[ -f "$PIDFILE" ]]; then
+    PID="$(cat "$PIDFILE")"
+
+    if kill -0 "$PID" 2>/dev/null; then
+        PROCESS_STATUS="RUNNING"
+    else
+        rm -f "$PIDFILE"
+    fi
 fi
 
-python3 - "$ROOT" <<'PY'
-import json, sys
+echo "PROCESS STATUS : $PROCESS_STATUS"
+
+if [[ -n "$PID" ]]; then
+    echo "PID            : $PID"
+fi
+
+echo
+
+# ------------------------------------------------------------
+# Current run information
+# ------------------------------------------------------------
+
+if [[ ! -f "$RUNINFO" ]]; then
+    echo "No conversion run information found."
+    echo
+    exit 0
+fi
+
+python3 - "$RUNINFO" "$PROCESS_STATUS" <<'PY'
+import json
+import sys
 from pathlib import Path
-root=Path(sys.argv[1])
-settings=root/'config'/'settings.txt'
-out=None
-for line in settings.read_text(encoding='utf-8').splitlines():
-    if line.startswith('OUTPUT_PATH='):
-        out=Path(line.split('=',1)[1].strip())
-        break
-if out is None:
-    raise SystemExit
-out=out.resolve()
-base=out.parent if out.name.lower()=='parquet' else out
-app=base.name
-reports=sorted(base.glob(f'{app}_????-??-??.json'), reverse=True)
-if not reports:
-    print('APPLICATION: -')
-    print('REPORT     : -')
-    raise SystemExit
-report=reports[0]
+
+runinfo = Path(sys.argv[1])
+process_status = sys.argv[2]
+
 try:
-    data=json.loads(report.read_text(encoding='utf-8'))
-except Exception as e:
-    print(f'REPORT ERROR: {e}')
-    raise SystemExit
-runs=data.get('runs',[])
-run=runs[-1] if runs else {}
-print(f'APPLICATION: {app}')
-print(f'RUN DATE   : {run.get("start_time", "-")}')
-print(f'RUN STATUS : {run.get("status", "-")}')
-print(f'INPUT      : {run.get("input_path", "-")}')
-print(f'OUTPUT     : {run.get("output_path", "-")}')
-print(f'TOTAL FILES: {run.get("csv_files", 0)}')
-print(f'PROCESSED  : {run.get("processed", 0)}')
-print(f'SUCCESS    : {run.get("success", 0)}')
-print(f'FAILED     : {run.get("failed", 0)}')
-print(f'TOTAL ROWS : {run.get("rows", 0)}')
-print(f'REPORT     : {report}')
-err=base/f'{app}_{report.stem.rsplit("_",1)[-1]}_error.log'
-if err.exists():
-    print(f'ERROR LOG  : {err}')
-print('')
-print('FILES')
-print('------------------------------------------------------------')
-for item in run.get('files',[]):
-    status=item.get('status','')
-    print(f'{status:<8} {item.get("table",""):<40} rows={item.get("rows",0)}')
-    if item.get('output'): print(f'         output: {item["output"]}')
-    if item.get('error'): print(f'         error : {item["error"]}')
+    data = json.loads(runinfo.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"ERROR: Unable to read run status: {exc}")
+    sys.exit(1)
+
+status = data.get("status", "UNKNOWN")
+
+if status == "RUNNING":
+    display_status = "RUNNING"
+elif status == "SUCCESS":
+    display_status = "SUCCESS"
+elif status == "PARTIAL_SUCCESS":
+    display_status = "PARTIAL SUCCESS"
+elif status == "FAILED":
+    display_status = "FAILED"
+else:
+    display_status = status
+
+# ------------------------------------------------------------
+# Run information
+# ------------------------------------------------------------
+
+print("------------------------------------------------------------")
+print("CONVERSION INFORMATION")
+print("------------------------------------------------------------")
+
+print(f"STATUS       : {display_status}")
+print(f"STARTED      : {data.get('start_time', '-')}")
+print(f"COMPLETED    : {data.get('end_time') or '-'}")
+print()
+
+print(f"INPUT        : {data.get('input_path', '-')}")
+print(f"OUTPUT       : {data.get('output_path', '-')}")
+print(f"DATATYPE JSON: {data.get('datatype_json', '-')}")
+print()
+
+# ------------------------------------------------------------
+# Progress
+# ------------------------------------------------------------
+
+print("------------------------------------------------------------")
+print("CONVERSION PROGRESS")
+print("------------------------------------------------------------")
+
+total = data.get("csv_files", 0)
+processed = data.get("processed", 0)
+success = data.get("success", 0)
+failed = data.get("failed", 0)
+rows = data.get("rows", 0)
+
+print(f"TOTAL FILES  : {total}")
+print(f"PROCESSED    : {processed}")
+print(f"SUCCESS      : {success}")
+print(f"FAILED       : {failed}")
+print(f"TOTAL ROWS   : {rows}")
+
+# Show percentage while running
+if isinstance(total, int) and total > 0:
+    percentage = (processed / total) * 100
+    print(f"PROGRESS     : {percentage:.2f}%")
+
+# ------------------------------------------------------------
+# Reports
+# ------------------------------------------------------------
+
+print()
+print("------------------------------------------------------------")
+print("REPORTS")
+print("------------------------------------------------------------")
+
+print(f"ALL FILE DETAILS : {data.get('report_path', '-')}")
+print(f"ERROR LOG        : {data.get('error_log_path', '-')}")
+print(f"DETAILED LOG     : {data.get('log_path', '-')}")
+
+print()
+print("The detailed report contains the result of every CSV file.")
+print("The error log contains only failed-file error details.")
+print()
+
 PY
