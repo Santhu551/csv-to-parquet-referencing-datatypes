@@ -14,3 +14,27 @@ src/__pycache__/
 
 status/
 
+# Runtime logs
+logs/*.log
+
+# Runtime status
+status/*.csv
+status/*.json
+status/*.pid
+
+# Customer input/output
+*.CSV
+*.csv
+*.LOB
+*.lob
+
+# Generated Parquet
+*.parquet
+*.parquet/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local configuration
+*.local

@@ -17,21 +17,22 @@ def print_usage():
     print("CSV -> PARQUET CONVERTER")
     print()
     print("Usage:")
-    print("  python3.12 main.py <input_path> <output_path> <datatypes_json>")
+    print("  python3.12 main.py <input_path> <output_path> <datatypes_json> <tika_host>")
     print()
     print("Example:")
-    print("  python3.12 main.py /home/postgres/input /home/postgres/output /home/postgres/input/datatypes_36.json")
+    print("  python3.12 main.py /home/postgres/input /home/postgres/output /home/postgres/input/datatypes_36.json http://svcoptim6035:9998")
     print()
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         print_usage()
         sys.exit(1)
 
     input_path = Path(sys.argv[1]).expanduser().resolve()
     output_path = Path(sys.argv[2]).expanduser().resolve()
     datatype_json = Path(sys.argv[3]).expanduser().resolve()
+    tika_host = sys.argv[4]
 
     if not input_path.exists():
         print(f"ERROR: Input path does not exist:\n  {input_path}")
@@ -48,6 +49,7 @@ def main():
         settings["INPUT_PATH"] = str(input_path)
         settings["OUTPUT_PATH"] = str(output_path)
         settings["DATATYPE_JSON"] = str(datatype_json)
+        settings["TIKA_HOST"] = tika_host
 
         run(settings, BASE_DIR)
 

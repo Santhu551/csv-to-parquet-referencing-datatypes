@@ -11,6 +11,7 @@ STATUSDIR="$ROOT/status"
 INPUT_PATH="${1:-}"
 OUTPUT_PATH="${2:-}"
 DATATYPE_JSON="${3:-}"
+TIKA_HOST="${4:-}"
 
 echo
 echo "============================================================"
@@ -18,21 +19,21 @@ echo "             CSV -> PARQUET BACKGROUND RUN"
 echo "============================================================"
 echo
 
-if [[ -z "$INPUT_PATH" || -z "$OUTPUT_PATH" || -z "$DATATYPE_JSON" ]]; then
+if [[ -z "$INPUT_PATH" || -z "$OUTPUT_PATH" || -z "$DATATYPE_JSON" || -z "$TIKA_HOST" ]]; then
     echo "Usage:"
     echo
-    echo "  ./scripts/background_run.sh <input_path> <output_path> <datatypes.json>"
+    echo "  ./scripts/background_run.sh <input_path> <output_path> <datatypes.json> <tika_host>"
     echo
     echo "Example:"
     echo
     echo "  ./scripts/background_run.sh \\"
     echo "    /home/postgres/input \\"
     echo "    /home/postgres/output \\"
-    echo "    /home/postgres/input/datatypes_36.json"
+    echo "    /home/postgres/input/datatypes_36.json \\"
+    echo "    http://svcoptim6035:9998"
     echo
     exit 1
 fi
-
 
 if [[ ! -e "$INPUT_PATH" ]]; then
     echo "ERROR: Input path does not exist:"
@@ -40,18 +41,15 @@ if [[ ! -e "$INPUT_PATH" ]]; then
     exit 1
 fi
 
-
 if [[ ! -f "$DATATYPE_JSON" ]]; then
     echo "ERROR: Datatype JSON file does not exist:"
     echo "  $DATATYPE_JSON"
     exit 1
 fi
 
-
 mkdir -p "$OUTPUT_PATH"
 mkdir -p "$LOGDIR"
 mkdir -p "$STATUSDIR"
-
 
 if [[ -f "$PIDFILE" ]]; then
 
@@ -73,28 +71,25 @@ if [[ -f "$PIDFILE" ]]; then
 
 fi
 
-
 LOGFILE="$LOGDIR/conversion_$(date '+%Y-%m-%d_%H-%M-%S').log"
-
 
 echo "INPUT      : $INPUT_PATH"
 echo "OUTPUT     : $OUTPUT_PATH"
 echo "DATATYPES  : $DATATYPE_JSON"
+echo "TIKA HOST  : $TIKA_HOST"
 echo "LOG        : $LOGFILE"
 echo
-
 
 nohup python3.12 "$ROOT/main.py" \
     "$INPUT_PATH" \
     "$OUTPUT_PATH" \
     "$DATATYPE_JSON" \
+    "$TIKA_HOST" \
     > "$LOGFILE" 2>&1 &
-
 
 PID=$!
 
 echo "$PID" > "$PIDFILE"
-
 
 echo "============================================================"
 echo "Conversion started in background."
@@ -104,7 +99,7 @@ echo "PID        : $PID"
 echo "Log        : $LOGFILE"
 echo
 echo "The conversion will continue even if this terminal/SSH session is disconnected."
-echo 
+echo
 echo
 echo "Check status:"
 echo
