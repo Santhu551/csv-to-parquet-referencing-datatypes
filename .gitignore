@@ -8,7 +8,7 @@ status/conversion_status.csv
 # Python
 __pycache__/
 *.py[cod]
-
+read_parquet.py
 src/__pycache__/
 *.pyc
 

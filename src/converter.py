@@ -282,6 +282,10 @@ def spark_session(settings, base_dir):
     # Match Archive Viewer: sparkprocess.py explicitly uses UTC before CSV parsing.
     # Set it on the active session as well as ensuring the effective session config.
     spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set(
+        "spark.sql.parquet.outputTimestampType",
+        "TIMESTAMP_MICROS"
+    )
 
     spark.sparkContext.setLogLevel(
         "ERROR"
