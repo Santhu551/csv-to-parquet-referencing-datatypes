@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import shutil
+import socket
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -39,9 +41,12 @@ from .run_report import (
     finish_report,
     append_error,
 )
-# ============================================================
-# LOGGER
-# ============================================================
+def safe_col(col_name):
+    """Reference a Spark column by its exact name, including dots or backticks."""
+    escaped_name = col_name.replace("`", "``")
+    return F.col(f"`{escaped_name}`")
+
+
 def logger(log_dir, output_path=None):
     """
     Application logger.
@@ -62,7 +67,6 @@ def logger(log_dir, output_path=None):
     )
     log = logging.getLogger("csv_to_parquet")
     log.setLevel(logging.INFO)
-    # Do not send messages to the root logger.
     log.propagate = False
     if not log.handlers:
         if (
@@ -84,9 +88,6 @@ def logger(log_dir, output_path=None):
         formatter = logging.Formatter(
             "%(asctime)s %(levelname)s %(message)s"
         )
-        # ----------------------------------------------------
-        # Detailed log file
-        # ----------------------------------------------------
         log_file = (
             Path(log_dir)
             / f"{app}_{date}.log"
@@ -102,12 +103,6 @@ def logger(log_dir, output_path=None):
         log.addHandler(
             file_handler
         )
-        # ----------------------------------------------------
-        # Customer terminal
-        #
-        # Only WARNING and ERROR messages are displayed.
-        # INFO messages remain in the log file.
-        # ----------------------------------------------------
         console_handler = logging.StreamHandler()
         console_handler.setLevel(
             logging.WARNING
@@ -116,9 +111,126 @@ def logger(log_dir, output_path=None):
         log.addHandler( console_handler)
 
     return log
-# ============================================================
-# SPARK SESSION
-# ============================================================
+def create_debug_logger(debug_log_dir, output_path=None):
+    """Create a per-run diagnostic log separate from normal logs."""
+    debug_dir = Path(debug_log_dir).expanduser()
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    if output_path and Path(output_path).resolve().name.lower() == "parquet":
+        app = Path(output_path).resolve().parent.name
+    elif output_path:
+        app = Path(output_path).resolve().name
+    else:
+        app = "csv_to_parquet"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = debug_dir / f"{app}_{timestamp}_pid{os.getpid()}_debug.log"
+
+    debug_log = logging.getLogger(
+        f"csv_to_parquet.debug.{os.getpid()}.{timestamp}"
+    )
+    debug_log.setLevel(logging.DEBUG)
+    debug_log.propagate = False
+
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s] %(message)s"
+    ))
+    debug_log.addHandler(handler)
+
+    debug_log.info(
+        "DIAGNOSTIC_LOG_STARTED | log_file=%s | pid=%s | ppid=%s | host=%s | cwd=%s",
+        log_path, os.getpid(), os.getppid(), socket.gethostname(), os.getcwd(),
+    )
+    return debug_log
+
+def _debug_path_state(debug_log, path, label, max_entries=25):
+    """Log filesystem metadata and a small directory snapshot; never mutate paths."""
+    path = Path(path)
+    try:
+        debug_log.info(
+            "PATH_STATE | label=%s | path=%s | exists=%s | is_symlink=%s | is_dir=%s",
+            label, path, path.exists(), path.is_symlink(), path.is_dir(),
+        )
+        if path.exists() or path.is_symlink():
+            st = path.lstat()
+            debug_log.info(
+                "PATH_STAT | label=%s | path=%s | mode=%s | device=%s | inode=%s | size=%s | mtime=%s",
+                label, path, oct(st.st_mode), st.st_dev, st.st_ino, st.st_size,
+                datetime.fromtimestamp(st.st_mtime).isoformat(),
+            )
+    except OSError:
+        debug_log.exception("PATH_INSPECTION_FAILED | label=%s | path=%s", label, path)
+
+    try:
+        probe = path
+        while not (probe.exists() or probe.is_symlink()):
+            parent = probe.parent
+            if parent == probe:
+                break
+            probe = parent
+        if probe.is_file() or probe.is_symlink():
+            probe = probe.parent
+        fs = os.statvfs(str(probe))
+        debug_log.info(
+            "FILESYSTEM_SPACE | label=%s | probe=%s | total_bytes=%s | available_bytes=%s | free_inodes=%s | total_inodes=%s",
+            label, probe, fs.f_blocks * fs.f_frsize,
+            fs.f_bavail * fs.f_frsize, fs.f_favail, fs.f_files,
+        )
+    except OSError:
+        debug_log.exception("FILESYSTEM_INSPECTION_FAILED | label=%s | path=%s", label, path)
+
+    if not path.is_dir() or path.is_symlink():
+        return
+    try:
+        entries = sorted(path.iterdir(), key=lambda item: item.name)[:max_entries]
+        for item in entries:
+            try:
+                st = item.lstat()
+                item_type = (
+                    "symlink" if item.is_symlink()
+                    else "directory" if item.is_dir()
+                    else "file"
+                )
+                debug_log.info(
+                    "PATH_ENTRY | label=%s | path=%s | type=%s | size=%s | inode=%s",
+                    label, item, item_type, st.st_size, st.st_ino,
+                )
+            except OSError:
+                debug_log.exception("PATH_ENTRY_INSPECTION_FAILED | path=%s", item)
+        if len(entries) == max_entries:
+            debug_log.info("PATH_ENTRY_LIMIT | label=%s | limit=%s", label, max_entries)
+    except OSError:
+        debug_log.exception("PATH_LIST_FAILED | label=%s | path=%s", label, path)
+
+def _debug_spark_configuration(debug_log, spark):
+    """Record effective Spark identity and relevant configuration once per run."""
+    sc = spark.sparkContext
+    debug_log.info(
+        "SPARK_SESSION | version=%s | app_name=%s | app_id=%s | master=%s | python_pid=%s | ppid=%s | host=%s",
+        spark.version, sc.appName, sc.applicationId, sc.master,
+        os.getpid(), os.getppid(), socket.gethostname(),
+    )
+    conf = sc.getConf()
+    for key in (
+        "spark.local.dir",
+        "spark.driver.memory",
+        "spark.executor.memory",
+        "spark.sql.parquet.datetimeRebaseModeInWrite",
+        "spark.sql.parquet.int96RebaseModeInWrite",
+        # "spark.sql.legacy.timeParserPolicy"
+
+    ):
+        try:
+            if key.startswith("spark.sql.parquet."):
+                value = spark.conf.get(key)
+            else:
+                value = conf.get(key, "<unset>")
+            debug_log.info("SPARK_CONFIG | %s=%s", key, value)
+        except Exception:
+            debug_log.exception("SPARK_CONFIG_READ_FAILED | key=%s", key)
+
 def spark_session(settings, base_dir):
     project_dir = str(
         Path(base_dir).resolve()
@@ -150,24 +262,66 @@ def spark_session(settings, base_dir):
         ),
         "spark.driver.extraPythonPath": project_dir,
         "spark.executorEnv.PYTHONPATH": project_dir,
+        "spark.sql.parquet.datetimeRebaseModeInWrite": settings.get(
+            "PARQUET_DATETIME_REBASE_MODE", "CORRECTED"
+        ),
+        "spark.sql.parquet.int96RebaseModeInWrite": settings.get(
+            "PARQUET_INT96_REBASE_MODE", "CORRECTED"
+        ),
+        # "spark.sql.legacy.timeParserPolicy": settings.get(
+        #     "LEGACY_TIME_PARSER_POLICY", "LEGACY"
+        # ),
+
     }.items():
         b = b.config(
             k,
             v,
         )
     spark = b.getOrCreate()
-    # --------------------------------------------------------
-    # Keep Spark console output quiet.
-    # Detailed application information is already written
-    # to the application log.
-    # --------------------------------------------------------
+
+    # Match Archive Viewer: sparkprocess.py explicitly uses UTC before CSV parsing.
+    # Set it on the active session as well as ensuring the effective session config.
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+
     spark.sparkContext.setLogLevel(
         "ERROR"
     )
     return spark
-# ============================================================
-# CAST COLUMN
-# ============================================================
+def _debug_timestamp_samples(debug_log, df, col, phase, max_rows=20):
+    """Log sample timestamp values without changing the DataFrame."""
+    if debug_log is None or col not in df.columns:
+        return
+    try:
+        data_type = df.schema[col].dataType.simpleString()
+        debug_log.info(
+            "TIMESTAMP_DIAGNOSTIC | phase=%s | column=%s | spark_type=%s",
+            phase, col, data_type,
+        )
+        selected = []
+        if "ID" in df.columns and col.upper() != "ID":
+            selected.append(F.col("ID").cast("string").alias("__debug_id"))
+        selected.append(safe_col(col).cast("string").alias("__debug_value"))
+        values = df.select(*selected)
+        sentinel_rows = (
+            values.where(F.col("__debug_value").rlike("1753|9999"))
+            .limit(max_rows).collect()
+        )
+        debug_log.info(
+            "TIMESTAMP_SENTINEL_VALUES | phase=%s | column=%s | count_sampled=%s | rows=%s",
+            phase, col, len(sentinel_rows),
+            [row.asDict(recursive=True) for row in sentinel_rows],
+        )
+        sample_rows = values.limit(min(5, max_rows)).collect()
+        debug_log.info(
+            "TIMESTAMP_GENERAL_SAMPLE | phase=%s | column=%s | rows=%s",
+            phase, col, [row.asDict(recursive=True) for row in sample_rows],
+        )
+    except Exception:
+        debug_log.exception(
+            "TIMESTAMP_DIAGNOSTIC_FAILED | phase=%s | column=%s",
+            phase, col,
+        )
+
 def cast_column(
     df,
     col,
@@ -182,7 +336,7 @@ def cast_column(
         return (
             df.withColumn(
                 col,
-                F.col(col).cast(
+                safe_col(col).cast(
                     spark_types[
                         "sparkDatatypes"
                     ]["NUMBER"]
@@ -197,7 +351,7 @@ def cast_column(
         return (
             df.withColumn(
                 col,
-                F.col(col).cast(
+                safe_col(col).cast(
                     spark_types[
                         "sparkDatatypes"
                     ]["NUMBER"]
@@ -206,16 +360,13 @@ def cast_column(
             "double",
         )
     if st.startswith("DECIMAL"):
-        # Exact original branch:
-        # DECIMAL and DECIMAL(p,s) are cast using
-        # the configured DECIMAL mapping.
         target = spark_types[
             "sparkDatatypes"
         ]["DECIMAL"]
         return (
             df.withColumn(
                 col,
-                F.col(col).cast(target),
+                safe_col(col).cast(target),
             ),
             target,
         )
@@ -229,7 +380,7 @@ def cast_column(
             df.withColumn(
                 col,
                 F.to_timestamp(
-                    F.col(col),
+                    safe_col(col),
                     spark_types[
                         "datetimeformat"
                     ]["timestamp"],
@@ -242,36 +393,36 @@ def cast_column(
             df.withColumn(
                 col,
                 F.when(
-                    F.col(col).rlike(
+                    safe_col(col).rlike(
                         r"^\d{1,2}/\d{1,2}/\d{4} "
                         r"\d{1,2}:\d{2}:\d{1,2} "
                         r"(AM|PM)$"
                     ),
                     F.to_timestamp(
-                        F.col(col),
+                        safe_col(col),
                         "M/d/yyyy hh:mm:ss a",
                     ),
                 )
                 .when(
-                    F.col(col).rlike(
+                    safe_col(col).rlike(
                         r".*\d{2}:\d{2}:\d{2}.*"
                     ),
                     F.to_date(
-                        F.col(col),
+                        safe_col(col),
                         "M/d/yyyy hh:mm:ss a",
                     ),
                 )
                 .when(
-                    F.col(col).rlike(
+                    safe_col(col).rlike(
                         r"^\d{1,2}/\d{1,2}/\d{4}$"
                     ),
                     F.to_date(
-                        F.col(col),
+                        safe_col(col),
                         "M/d/yyyy",
                     ),
                 )
                 .otherwise(
-                    F.col(col).cast("date")
+                    safe_col(col).cast("date")
                 ),
             ),
             mapped,
@@ -280,13 +431,10 @@ def cast_column(
     return (
         df.withColumn(
             col,
-            F.col(col).cast(mapped),
+            safe_col(col).cast(mapped),
         ),
         mapped,
     )
-# ============================================================
-# PROCESS ONE CSV
-# ============================================================
 def process_csv(
     spark,
     csv_path,
@@ -296,12 +444,25 @@ def process_csv(
     spark_types,
     logger_obj,
     manifest_path,
+    debug_log=None,
 ):
 
+    if debug_log:
+        debug_log.info(
+            "CSV_PROCESS_START | csv=%s | output_root=%s | datatype_json=%s | pid=%s",
+            csv_path, output_root, datatype_json, os.getpid(),
+        )
+
+    if debug_log:
+        debug_log.info("STAGE_START | stage=load_datatypes | csv=%s", csv_path)
     data = load_datatypes(
         datatype_json
     )
+    if debug_log:
+        debug_log.info("STAGE_COMPLETE | stage=load_datatypes | csv=%s", csv_path)
 
+    if debug_log:
+        debug_log.info("STAGE_START | stage=resolve_table_metadata | csv=%s", csv_path)
     schema, table = fetch_schema_and_table(
         csv_path
     )
@@ -340,16 +501,19 @@ def process_csv(
 
     lob_columns = []
 
+    if debug_log:
+        debug_log.info(
+            "TABLE_METADATA_RESOLVED | csv=%s | schema=%s | table=%s | metadata_table=%s | guid=%s | native_lob=%s | native_clob=%s",
+            csv_path, schema, table, metadata_table, guid, native, native_clob,
+        )
+        debug_log.info("STAGE_COMPLETE | stage=resolve_table_metadata | table=%s", table)
+
     if isinstance(tinfo, dict):
 
         lob_columns = tinfo.get(
             "LOB_COLUMNS",
             [],
         )
-
-    # --------------------------------------------------------
-    # Detailed information goes to log file.
-    # --------------------------------------------------------
 
     logger_obj.info(
         "CSV       : %s",
@@ -393,9 +557,8 @@ def process_csv(
         lob_columns,
     )
 
-    # --------------------------------------------------------
-    # Read CSV
-    # --------------------------------------------------------
+    if debug_log:
+        debug_log.info("STAGE_START | stage=read_csv | table=%s | csv=%s", table, csv_path)
 
     df = (
         spark.read
@@ -424,6 +587,7 @@ def process_csv(
                 "₠",
             ),
         )
+        .option("timestampFormat", "MM/dd/yyyy hh:mm:ss a")
         .option(
             "delimiter",
             settings.get(
@@ -444,11 +608,34 @@ def process_csv(
         )
     )
 
-    df = df.na.replace(
-        "Φ",
-        None,
-    )
+    if debug_log:
+        debug_log.info(
+            "STAGE_COMPLETE | stage=read_csv | table=%s | columns=%s",
+            table, df.columns,
+        )
+        debug_log.info(
+            "CSV_READ_OPTIONS | encoding=%s | delimiter=%r | quote=%r | escape=%r | header=true | multiline=true",
+            settings.get("ENCODING", "utf-8"),
+            settings.get("DELIMITER", ","),
+            settings.get("QUOTE", "₠"),
+            settings.get("ESCAPE", "\\\\"),
+        )
+        debug_log.info(
+            "TIMESTAMP_PARSE_FORMAT | configured_timestamp_format=%r",
+            spark_types.get("datetimeformat", {}).get("timestamp"),
+        )
 
+    df = df.na.replace(
+    "F",
+    None,
+)
+
+    df.na.replace("Φ", None)
+
+    df = df.na.replace(
+    "\u03A6",
+    None,
+)
     with_clob = (
         settings.get(
             "WITH_CLOB",
@@ -479,10 +666,6 @@ def process_csv(
         cleanup_manifest.unlink()
 
     cleanup_cols = []
-
-    # --------------------------------------------------------
-    # UDFs
-    # --------------------------------------------------------
 
     def path_udf(
         func,
@@ -541,16 +724,25 @@ def process_csv(
         StringType(),
     )
 
-    # --------------------------------------------------------
-    # Process columns
-    # --------------------------------------------------------
-
     for col in list(df.columns):
 
         st = normalize_column_lookup(
             tinfo,
             col,
         )
+
+        expected_spark_type = (
+            spark_types.get("sparkDatatypes", {}).get(st)
+            if st is not None else None
+        )
+        if expected_spark_type == "timestamp":
+            if debug_log:
+                debug_log.info(
+                    "TIMESTAMP_MAPPING | column=%s | source_type=%s | mapped_type=%s | configured_format=%r",
+                    col, st, expected_spark_type,
+                    spark_types.get("datetimeformat", {}).get("timestamp"),
+                )
+            _debug_timestamp_samples(debug_log, df, col, "RAW_BEFORE_CAST")
 
         if st is None:
 
@@ -566,7 +758,7 @@ def process_csv(
             df = df.withColumn(
                 col,
                 rtrim(
-                    F.col(col)
+                    safe_col(col)
                 ),
             )
 
@@ -581,11 +773,6 @@ def process_csv(
                 "blobdatatype"
             ]
         )
-
-        # ----------------------------------------------------
-        # Original converter excludes CLOB/BLOB columns
-        # when corresponding switch is false.
-        # ----------------------------------------------------
 
         if (
             is_clob
@@ -612,10 +799,6 @@ def process_csv(
 
             continue
 
-        # ----------------------------------------------------
-        # Native LOB handling
-        # ----------------------------------------------------
-
         if native:
 
             if (
@@ -634,7 +817,7 @@ def process_csv(
                 df = df.withColumn(
                     col,
                     native_text_udf(
-                        F.col(col)
+                        safe_col(col)
                     ),
                 )
 
@@ -653,19 +836,19 @@ def process_csv(
                     df.withColumn(
                         col + "_ext",
                         ext_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                     .withColumn(
                         col + "_filename",
                         fn_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                     .withColumn(
                         col,
                         blob_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                 )
@@ -684,7 +867,7 @@ def process_csv(
                 df = df.withColumn(
                     col,
                     clob_udf(
-                        F.col(col)
+                        safe_col(col)
                     ),
                 )
 
@@ -698,6 +881,8 @@ def process_csv(
                     st,
                     spark_types,
                 )
+                if expected_spark_type == "timestamp":
+                    _debug_timestamp_samples(debug_log, df, col, "PARSED_AFTER_CAST")
 
         else:
 
@@ -717,7 +902,7 @@ def process_csv(
 
                 df = df.withColumn(
                     col,
-                    F.col(col).cast(
+                    safe_col(col).cast(
                         spark_types[
                             "sparkDatatypes"
                         ]["VARCHAR2"]
@@ -740,19 +925,19 @@ def process_csv(
                     df.withColumn(
                         col + "_ext",
                         ext_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                     .withColumn(
                         col + "_filename",
                         fn_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                     .withColumn(
                         col,
                         blob_udf(
-                            F.col(col)
+                            safe_col(col)
                         ),
                     )
                 )
@@ -772,7 +957,7 @@ def process_csv(
                 df = df.withColumn(
                     col,
                     clob_udf(
-                        F.col(col)
+                        safe_col(col)
                     ),
                 )
 
@@ -786,6 +971,8 @@ def process_csv(
                     st,
                     spark_types,
                 )
+                if expected_spark_type == "timestamp":
+                    _debug_timestamp_samples(debug_log, df, col, "PARSED_AFTER_CAST")
 
         logger_obj.info(
             "  %s: source='%s' -> %s",
@@ -793,14 +980,6 @@ def process_csv(
             st,
             mapped,
         )
-
-    # --------------------------------------------------------
-    # Write Parquet
-    # --------------------------------------------------------
-
-    # No driver-side list of all LOB paths.
-    # Path cleanup is optional and can be done by streaming
-    # the CSV later.
 
     tmp = (
         Path(output_root)
@@ -812,11 +991,24 @@ def process_csv(
         / (table + ".parquet")
     )
 
-    if tmp.exists():
+    if debug_log:
+        debug_log.info(
+            "TABLE_WRITE_PREPARE | table=%s | csv=%s | output_root=%s | staging=%s | final=%s | compression=%s | overwrite=%s",
+            table, csv_path, output_root, tmp, final,
+            settings.get("COMPRESSION", "zstd"),
+            settings.get("OVERWRITE", "false"),
+        )
+        _debug_path_state(debug_log, tmp, "STAGING_BEFORE_CLEANUP")
+        _debug_path_state(debug_log, final, "FINAL_BEFORE_WRITE")
 
+    if tmp.exists():
+        if debug_log:
+            debug_log.info("STAGING_CLEANUP_START | table=%s | path=%s", table, tmp)
         shutil.rmtree(
             tmp
         )
+        if debug_log:
+            debug_log.info("STAGING_CLEANUP_COMPLETE | table=%s | path=%s", table, tmp)
 
     if (
         final.exists()
@@ -833,10 +1025,13 @@ def process_csv(
         )
 
     if final.exists():
-
+        if debug_log:
+            debug_log.info("FINAL_OUTPUT_CLEANUP_START | table=%s | path=%s", table, final)
         shutil.rmtree(
             final
         )
+        if debug_log:
+            debug_log.info("FINAL_OUTPUT_CLEANUP_COMPLETE | table=%s | path=%s", table, final)
 
     tmp.mkdir(
         parents=True,
@@ -848,11 +1043,6 @@ def process_csv(
         final,
     )
 
-    # --------------------------------------------------------
-    # Write Spark schema to detailed log instead of printing
-    # it directly to the customer terminal.
-    # --------------------------------------------------------
-
     schema_text = (
         df._jdf.schema().treeString()
     )
@@ -861,54 +1051,106 @@ def process_csv(
         "SPARK SCHEMA:\n%s",
         schema_text,
     )
+    if debug_log:
+        debug_log.info("DATAFRAME_SCHEMA | table=%s | schema=\\n%s", table, schema_text)
+        for diagnostic_col in (
+            "STARTDATE", "FACETSSTARTDATE", "ENDDATE", "FACETSENDDATE",
+            "CREATEDDATE", "UPDATEDDATE", "FACETSSYNCDATE",
+        ):
+            if diagnostic_col in df.columns:
+                _debug_timestamp_samples(
+                    debug_log, df, diagnostic_col, "FINAL_BEFORE_PARQUET_WRITE"
+                )
 
-    df.write \
-        .mode("overwrite") \
-        .option(
-            "compression",
-            settings.get(
-                "COMPRESSION",
-                "zstd",
-            ),
-        ) \
-        .parquet(
-            str(tmp)
+    write_started = time.perf_counter()
+    if debug_log:
+        debug_log.info(
+            "PARQUET_WRITE_START | table=%s | csv=%s | staging=%s | final=%s",
+            table, csv_path, tmp, final,
         )
+
+    try:
+        df.write \
+            .mode("overwrite") \
+            .option(
+                "compression",
+                settings.get(
+                    "COMPRESSION",
+                    "zstd",
+                ),
+            ) \
+            .parquet(
+                str(tmp)
+            )
+    except Exception:
+        if debug_log:
+            debug_log.exception(
+                "PARQUET_WRITE_FAILED | table=%s | csv=%s | staging=%s | elapsed_seconds=%.3f",
+                table, csv_path, tmp, time.perf_counter() - write_started,
+            )
+            _debug_path_state(debug_log, tmp, "STAGING_AFTER_WRITE_FAILURE")
+        raise
+    else:
+        if debug_log:
+            debug_log.info(
+                "PARQUET_WRITE_RETURNED | table=%s | staging=%s | elapsed_seconds=%.3f",
+                table, tmp, time.perf_counter() - write_started,
+            )
+            _debug_path_state(debug_log, tmp, "STAGING_AFTER_WRITE")
 
     if not any(
         tmp.glob("*.parquet")
     ):
+        if debug_log:
+            debug_log.error(
+                "PARQUET_OUTPUT_EMPTY | table=%s | staging=%s | entries=%s",
+                table, tmp, [p.name for p in list(tmp.iterdir())[:25]] if tmp.exists() else "<missing>",
+            )
 
         raise RuntimeError(
             "Spark completed without parquet "
             f"data: {tmp}"
         )
 
-    tmp.rename(
-        final
-    )
+    if debug_log:
+        debug_log.info("STAGE_START | stage=rename_staging_to_final | table=%s | staging=%s | final=%s", table, tmp, final)
 
-    # --------------------------------------------------------
-    # Row count
-    # --------------------------------------------------------
+    try:
+        tmp.rename(final)
+    except Exception:
+        if debug_log:
+            debug_log.exception("OUTPUT_RENAME_FAILED | table=%s | staging=%s | final=%s", table, tmp, final)
+            _debug_path_state(debug_log, tmp, "STAGING_AFTER_RENAME_FAILURE")
+            _debug_path_state(debug_log, final, "FINAL_AFTER_RENAME_FAILURE")
+        raise
 
-    rows = (
-        spark.read
-        .parquet(
-            str(final)
+    if debug_log:
+        debug_log.info("STAGE_COMPLETE | stage=rename_staging_to_final | table=%s | final=%s", table, final)
+
+    if debug_log:
+        debug_log.info("STAGE_START | stage=readback_row_count | table=%s | final=%s", table, final)
+
+    try:
+        rows = (
+            spark.read
+            .parquet(
+                str(final)
+            )
+            .count()
         )
-        .count()
-    )
+    except Exception:
+        if debug_log:
+            debug_log.exception("PARQUET_READBACK_FAILED | table=%s | final=%s", table, final)
+        raise
+
+    if debug_log:
+        debug_log.info("STAGE_COMPLETE | stage=readback_row_count | table=%s | rows=%s", table, rows)
 
     logger_obj.info(
         "SUCCESS   : %s rows=%s",
         final,
         rows,
     )
-
-    # --------------------------------------------------------
-    # Optional LOB deletion
-    # --------------------------------------------------------
 
     if (
         settings.get(
@@ -918,9 +1160,6 @@ def process_csv(
         == "true"
         and cleanup_cols
     ):
-
-        # Stream only the path values from the CSV.
-        # Never accumulate all paths in memory.
 
         cleanup_df = (
             spark.read
@@ -999,10 +1238,6 @@ def process_csv(
                                 e,
                             )
 
-    # --------------------------------------------------------
-    # Optional CSV deletion
-    # --------------------------------------------------------
-
     if (
         settings.get(
             "DELETE_CSV",
@@ -1014,10 +1249,6 @@ def process_csv(
         Path(
             csv_path
         ).unlink()
-
-    # --------------------------------------------------------
-    # Manifest
-    # --------------------------------------------------------
 
     append_record(
         manifest_path,
@@ -1039,11 +1270,6 @@ def process_csv(
     )
 
     return final
-
-
-# ============================================================
-# REPORT FAILURE CHECK
-# ============================================================
 
 def _report_failed(report):
 
@@ -1082,11 +1308,6 @@ def _report_failed(report):
 
     return False
 
-
-# ============================================================
-# CURRENT RUN
-# ============================================================
-
 def write_current_run(
     path,
     data,
@@ -1115,19 +1336,10 @@ def write_current_run(
         encoding="utf-8",
     )
 
-
-# ============================================================
-# RUN
-# ============================================================
-
 def run(
     settings,
     base_dir,
 ):
-
-    # --------------------------------------------------------
-    # Paths
-    # --------------------------------------------------------
 
     log_dir = Path(
         settings.get(
@@ -1181,10 +1393,6 @@ def run(
         .resolve()
     )
 
-    # --------------------------------------------------------
-    # Create directories
-    # --------------------------------------------------------
-
     out.mkdir(
         parents=True,
         exist_ok=True,
@@ -1200,18 +1408,25 @@ def run(
         exist_ok=True,
     )
 
-    # --------------------------------------------------------
-    # Logger
-    # --------------------------------------------------------
-
     log = logger(
         log_dir,
         out,
     )
 
-    # --------------------------------------------------------
-    # Spark datatype configuration
-    # --------------------------------------------------------
+    debug_dir_value = settings.get("DATETIME_DEBUG_LOG_DIR", "./datetimelogs")
+    debug_dir = Path(debug_dir_value).expanduser()
+    if not debug_dir.is_absolute():
+        debug_dir = Path(base_dir) / debug_dir
+    debug_log = create_debug_logger(debug_dir, out)
+    debug_file_path = next(
+        (Path(handler.baseFilename) for handler in debug_log.handlers
+         if isinstance(handler, logging.FileHandler)),
+        debug_dir,
+    )
+    debug_log.info(
+        "RUN_START | input=%s | output=%s | datatype_json=%s | debug_log=%s",
+        inp, out, dtype, debug_file_path,
+    )
 
     spark_types = json.loads(
         (
@@ -1222,10 +1437,6 @@ def run(
             encoding="utf-8"
         )
     )
-
-    # --------------------------------------------------------
-    # Find CSV files
-    # --------------------------------------------------------
 
     files = (
         [inp]
@@ -1246,17 +1457,9 @@ def run(
         len(files),
     )
 
-    # --------------------------------------------------------
-    # Previous conversion information
-    # --------------------------------------------------------
-
     previous = latest_by_input(
         manifest
     )
-
-    # --------------------------------------------------------
-    # Report
-    # --------------------------------------------------------
 
     report = start_report(
         out,
@@ -1279,10 +1482,6 @@ def run(
         report["error_path"],
     )
 
-    # --------------------------------------------------------
-    # Current run information
-    # --------------------------------------------------------
-
     current_run = {
         "status": "RUNNING",
 
@@ -1301,6 +1500,8 @@ def run(
         "datatype_json": str(dtype),
 
         "log_path": "",
+
+        "debug_log_path": str(debug_file_path.resolve()),
 
         "report_path": str(
             report["path"]
@@ -1322,10 +1523,6 @@ def run(
 
         "rows": 0,
     }
-
-    # --------------------------------------------------------
-    # Determine detailed log path
-    # --------------------------------------------------------
 
     for handler in log.handlers:
 
@@ -1349,20 +1546,21 @@ def run(
         current_run,
     )
 
-    # --------------------------------------------------------
-    # Start Spark
-    # --------------------------------------------------------
+    debug_log.info("STAGE_START | stage=create_spark_session")
+    try:
+        spark = spark_session(
+            settings,
+            base_dir,
+        )
+    except Exception:
+        debug_log.exception("SPARK_SESSION_START_FAILED")
+        raise
 
-    spark = spark_session(
-        settings,
-        base_dir,
-    )
+    debug_log.info("STAGE_COMPLETE | stage=create_spark_session")
+    _debug_spark_configuration(debug_log, spark)
+    _debug_path_state(debug_log, out, "OUTPUT_ROOT_AT_RUN_START")
 
     try:
-
-        # ----------------------------------------------------
-        # Process files
-        # ----------------------------------------------------
 
         for csv in files:
 
@@ -1370,10 +1568,6 @@ def run(
                 str(csv),
                 {},
             )
-
-            # -----------------------------------------------
-            # Skip previously successful file
-            # -----------------------------------------------
 
             if (
                 previous_file.get(
@@ -1405,10 +1599,6 @@ def run(
 
                 continue
 
-            # -----------------------------------------------
-            # Determine schema/table
-            # -----------------------------------------------
-
             schema, table = (
                 fetch_schema_and_table(
                     csv
@@ -1416,10 +1606,6 @@ def run(
             )
 
             csv_output = out
-
-            # -----------------------------------------------
-            # Schema-specific output
-            # -----------------------------------------------
 
             if schema:
 
@@ -1435,10 +1621,6 @@ def run(
                 parents=True,
                 exist_ok=True,
             )
-
-            # -----------------------------------------------
-            # Running manifest entry
-            # -----------------------------------------------
 
             append_record(
                 manifest,
@@ -1467,10 +1649,6 @@ def run(
 
             try:
 
-                # -------------------------------------------
-                # Actual conversion
-                # -------------------------------------------
-
                 final = process_csv(
                     spark,
                     csv,
@@ -1480,6 +1658,7 @@ def run(
                     spark_types,
                     log,
                     manifest,
+                    debug_log,
                 )
 
                 parquet_files = list(
@@ -1487,10 +1666,6 @@ def run(
                         "*.parquet"
                     )
                 )
-
-                # -------------------------------------------
-                # Get row count from manifest
-                # -------------------------------------------
 
                 latest = (
                     latest_by_input(
@@ -1516,10 +1691,6 @@ def run(
                 ):
 
                     rows = 0
-
-                # -------------------------------------------
-                # Add successful file to report
-                # -------------------------------------------
 
                 add_file_result(
                     report,
@@ -1560,12 +1731,13 @@ def run(
 
             except Exception as e:
 
+                debug_log.exception(
+                    "CSV_CONVERSION_FAILED | csv=%s | table=%s | exception_type=%s | exception=%s",
+                    csv, table, type(e).__name__, e,
+                )
                 error_text = (
                     traceback.format_exc()
                 )
-
-                # Detailed traceback remains in
-                # the developer log.
 
                 log.exception(
                     "FAILED: %s",
@@ -1622,10 +1794,6 @@ def run(
                         "error": repr(e),
                     },
                 )
-
-            # -----------------------------------------------
-            # Update current run
-            # -----------------------------------------------
 
             try:
 
@@ -1699,18 +1867,10 @@ def run(
                     "processed"
                 ] += 1
 
-            # -----------------------------------------------
-            # Save current status
-            # -----------------------------------------------
-
             write_current_run(
                 current_run_path,
                 current_run,
             )
-
-        # ----------------------------------------------------
-        # Final status
-        # ----------------------------------------------------
 
         failed = _report_failed(
             report
@@ -1726,10 +1886,10 @@ def run(
             report,
             final_status,
         )
-
-        # ----------------------------------------------------
-        # Read final report statistics
-        # ----------------------------------------------------
+        debug_log.info(
+            "RUN_FINISHED | status=%s | report=%s | error_log=%s",
+            final_status, report.get("path"), report.get("error_path"),
+        )
 
         try:
 
@@ -1819,10 +1979,6 @@ def run(
                 "%Y-%m-%d %H:%M:%S"
             )
 
-        # ----------------------------------------------------
-        # Final current run status
-        # ----------------------------------------------------
-
         current_run[
             "status"
         ] = final_status
@@ -1831,13 +1987,6 @@ def run(
             current_run_path,
             current_run,
         )
-
-        # ----------------------------------------------------
-        # CUSTOMER-FACING FINAL SUMMARY
-        #
-        # Do NOT use log.info() here.
-        # INFO messages are intentionally file-only.
-        # ----------------------------------------------------
 
         print()
         print("=" * 60)
@@ -1902,6 +2051,13 @@ def run(
                 "",
             ),
         )
+        print(
+            "DEBUG LOG    :",
+            current_run.get(
+                "debug_log_path",
+                "",
+            ),
+        )
 
         print()
 
@@ -1910,10 +2066,13 @@ def run(
     finally:
 
         spark.stop()
-
-        # ----------------------------------------------------
-        # Remove PID file if it belongs to this process
-        # ----------------------------------------------------
+        debug_log.info("SPARK_SESSION_STOPPED")
+        for handler in list(debug_log.handlers):
+            try:
+                handler.flush()
+                handler.close()
+            finally:
+                debug_log.removeHandler(handler)
 
         pid_file = (
             status_dir
