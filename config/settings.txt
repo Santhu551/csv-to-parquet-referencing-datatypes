@@ -16,8 +16,10 @@ DELETE_CSV=false
 # Parquet output
 COMPRESSION=zstd
 OVERWRITE=false
+PARQUET_DATETIME_REBASE_MODE=CORRECTED
+PARQUET_INT96_REBASE_MODE=CORRECTED
 
-# CSV reader settings copied from the original converter
+# CSV reader settings. Archive Viewer uses the Unicode quote character U+20A0 (₠).
 ESCAPE=\
 QUOTE=₠
 DELIMITER=,
@@ -33,11 +35,15 @@ SPARK_NETWORK_TIMEOUT=800s
 SPARK_EXECUTOR_HEARTBEAT_INTERVAL=60s
 
 # Optional Apache Tika settings. Set TIKA_JAR if MIME detection must auto-start Tika.
-TIKA_HOST=
+TIKA_HOST=localhost
 TIKA_PORT=9998
-TIKA_JAR=
+TIKA_JAR=/home/postgres/tika/tika-server-standard-2.6.0.jar
 TIKA_START_TIMEOUT=60
 
 # Tracking/logging
 LOG_DIR=./logs
 STATUS_DIR=./status
+
+# Diagnostic logs for troubleshooting conversion failures
+DEBUG_LOG_DIR=./debugging_logs
+DATETIME_DEBUG_LOG_DIR=./datetimelogs
